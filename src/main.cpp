@@ -20,14 +20,14 @@ int main()
     // - THE ASSET'S LOCATION
     // - DIAMTER OF A PARTICLE (Should Be Greater Than 0)
     // RETURNS:
-    // - 1 IF DIAMETER IS INVALID OR IMAGE NOT FOUND
+    // - 1 IF DIAMETER IS INVALID, IMAGE NOT FOUND OR THE PARTICLE SHADER FAILS
     // - 0 IF EVERYTHING GOES WELL
     if (Renderer::loadAsset("../assets/circle.png", static_cast<uint8_t>(PARTICLE_DIAMETER)))
     {
         return 1;
     }
 
-    // BUILDS THE COLOR TABLE AND CLEARS THE PARTICLE STATE
+    // CLEARS THE PARTICLE STATE AND BRINGS THE WORKER POOL UP
     Solver::preComputeInitialValues();
 
     bool pause = false;

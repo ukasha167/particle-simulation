@@ -19,8 +19,8 @@ public:
     inline static uint32_t currentParticlesCount = 0;
 
 public:
-    // BUILDS THE COLOR TABLE, CLEARS THE PARTICLE STATE AND BRINGS THE WORKER
-    // POOL UP. MUST BE PAIRED WITH shutdown().
+    // CLEARS THE PARTICLE STATE AND BRINGS THE WORKER POOL UP. MUST BE PAIRED
+    // WITH shutdown().
     static void preComputeInitialValues();
     static void shutdown();
 
@@ -50,7 +50,7 @@ private:
         alignas(64) std::array<float, TOTAL_PARTICLES_COUNT> posY;
         alignas(64) std::array<float, TOTAL_PARTICLES_COUNT> velX;
         alignas(64) std::array<float, TOTAL_PARTICLES_COUNT> velY;
-        alignas(64) std::array<Color, TOTAL_PARTICLES_COUNT> color;
+        alignas(64) std::array<float, TOTAL_PARTICLES_COUNT> heat;
     };
 
     // A CONTIGUOUS RUN OF GRID ROWS, INCLUSIVE AT BOTH ENDS, OWNED BY ONE THREAD
@@ -71,8 +71,6 @@ private:
     alignas(64) static std::array<uint32_t, CELL_RANGE_SIZE> cellRange;
     alignas(64) static std::array<uint32_t, TOTAL_PARTICLES_COUNT> particleCellIDs;
 
-    static std::array<Color, 256> rainbowLUT;
-    inline static uint32_t spawnColorCursor = 0;
 
     // ---------------------------   PARALLEL SORT SCRATCH   ---------------------------
 
@@ -86,6 +84,16 @@ private:
     static uint32_t cursorStride;
 
     static std::array<uint32_t, ThreadPool::MAX_THREADS + 1> chunkBase;
+
+    // THE CELL WINDOW EACH THREAD'S HISTOGRAM WAS LAST WRITTEN IN, INCLUSIVE AT BOTH
+    // ENDS, lo > hi MEANING EMPTY. OUTSIDE ITS WINDOW A HISTOGRAM IS ALWAYS ZERO, SO
+    // THE SORT ONLY EVER CLEARS, MERGES AND REWRITES INSIDE IT.
+    static std::array<uint32_t, ThreadPool::MAX_THREADS> histogramLo;
+    static std::array<uint32_t, ThreadPool::MAX_THREADS> histogramHi;
+
+    // HOW FAR INTO EACH CELL THE EARLIER THREADS' PARTICLES REACH WHILE THE CURSORS
+    // ARE BEING CUT. EACH CHUNK ONLY EVER WRITES ITS OWN ROWS OF IT.
+    alignas(64) static std::array<uint32_t, CELL_RANGE_SIZE> runningCursor;
 
     // ---------------------------   CONTACT SWEEP PLAN   ---------------------------
 
@@ -102,7 +110,6 @@ private:
     static uint32_t bandCount;
 
     static void bindBuffers();
-    static void computeColorValues();
 
     // SettleFirst = true FUSES THE PREVIOUS SUB-STEP'S WALL PASS INTO THE HEAD OF
     // THIS ONE. BOTH ARE PURELY PER-PARTICLE, SO THE FUSED LOOP IS EXACTLY THE OLD
@@ -127,7 +134,14 @@ private:
     template <bool Brace>
     static void solveContacts();
 
+    // Finish = true CLOSES A FRAME AND LEAVES PLAIN VELOCITY IN THE ARRAYS.
+    // Finish = false RUNS INSIDE A SUB-STEP AND KEEPS THE SWEEP'S ENCODING.
+    template <bool Finish>
     static void applyBoundaries();
+
+    // MOVES EVERY PARTICLE'S HEAT TOWARDS ITS KINETIC ENERGY. RUNS ONCE AT THE END
+    // OF A FRAME, WHEN THE VELOCITIES ARE PLAIN AGAIN.
+    static void updateHeat();
 
     // TRUE IF NOTHING ALREADY SITS WITHIN ONE DIAMETER OF (x, y). USES THE GRID
     // LEFT OVER FROM THE PREVIOUS FRAME, WHICH IS STILL EXACT BECAUSE NOTHING HAS
