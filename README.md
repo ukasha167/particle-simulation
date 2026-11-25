@@ -1,183 +1,94 @@
-#  CPU Particle Simulation (Optimized)
+# Particle-Simulation
 
-A high-performance physics engine written in C++.
-This project is a case study in **Data-Oriented Design**. My first version held about 700 particles at 60 FPS. Restructuring memory access got one thread to 17,000, and spreading the solver across 4 threads took it to **100,000 particles at 60 FPS** on an M1 Air.
+100,000 particles of sand on the CPU, 4 threads of an M1 MacBook Air, no GPU compute. Pour it, push it, pull it with the mouse.
 
-### The Numbers
+![The emitter pouring into a 60k pile, a crater pushed out of the settled 100k pile, the first 20k landing, and a close-up of individual particles packed into grains](docs/collage.jpg)
 
-I rewrote my simulation engine from scratch. Same machine. Same target FPS. Drastically different results.
+![C++23](https://img.shields.io/badge/C++-23-00599C?logo=cplusplus&logoColor=white)
+![raylib](https://img.shields.io/badge/raylib-6.0-000000?logo=raylib&logoColor=white)
+![CMake](https://img.shields.io/badge/CMake-3.25+-064F8C?logo=cmake&logoColor=white)
+![Threads](https://img.shields.io/badge/threads-4_P--cores-8A2BE2)
+![Data-oriented](https://img.shields.io/badge/design-data--oriented-E34F26)
+![Platforms](https://img.shields.io/badge/macOS_·_Linux_·_Windows-555555)
 
-| Metric | Old Version | Single Thread | **Current** |
-| --- | --- | --- | --- |
-| **Particle Count** | ~700 | 17,000+ | **100,000** |
-| **FPS** | 60 | 60 | **60** |
-| **CPU Threads** | 1 | 1 | **4** |
-| **Particles vs. Old** | 1x | 24x | **~140x** |
+The colour is heat: kinetic energy on a log scale, blue at rest, red when fast. The thin dark lines in the settled pile are grain boundaries, where two packed regions meet at different angles. Nobody drew them. They come out of the contact solver.
 
-**Note:** The old version which I compared to, is not included in this repository. However I can explain why that was so slow:
+## Where it started
 
-*  It was rendered in SFML with not VertexBuffers, which means only one particle was drawn at a time. Raylib, however uses batch rendering by default.
-*  It used Euler Integeration which is unstable at larger number of particles, and also introduced extra energy.
-*  Algorithms of choice were very inefficient.
-*  Data was not handled well, which caused severed cache misses.
+The first version, in SFML with Euler integration and a `std::vector` per grid cell, managed about 700 particles at 60 FPS. That code is in V1 below. This version holds 100,000.
 
-### The "Hard Mode" Constraints
+| Version | Particles at 60 FPS | What changed |
+|---|---|---|
+| SFML prototype | ~700 | Euler, array of structs, one draw call per particle |
+| V7 (single thread) | 17,000 | Verlet, struct of arrays, uniform grid sorted every frame |
+| Now (4 threads) | 100,000 | Thread pool, branch-free contacts, instanced drawing |
 
-To ensure this was a test of raw engineering efficiency, I imposed strict rules:
+## Numbers
 
-*  **CPU Only, 4 Threads:** The solver runs on 4 worker threads, one per performance core of the M1.
-*  **No GPU Compute:** No Compute Shaders or CUDA. Pure CPU physics.
-*  **No Cheats:** Every particle checks for collisions with relevant neighbors. 18 sub-steps per frame.
+Every number here was measured on an M1 MacBook Air. The before and after numbers are recorded in the source, next to the code they describe.
 
-### The Optimization Strategy
+| Part of the frame | Before | After | Change |
+|---|---|---|---|
+| Drawing 100k particles | 9 ms | 0.7 ms | One instanced draw call, 3 floats uploaded per particle (`renderer.cpp`) |
+| Integration | 3.1 ms | 1.6 ms | Branch-free wall check, so the compiler vectorises the loop (`solver.cpp`) |
+| Contact sweeps | 13.5 ms | 10.1 ms | The contact kick is stored inside the position, so a contact writes half the memory |
+| Settled 100k frame | 15.2 ms | 13.1 ms | Branchless contact with `fmax`. CPU counters showed 37% of the sweep thrown away on mispredicted branches |
+| 100k frame under the mouse | 24.1 ms | 14.7 ms | Same change. Under the mouse it was 58% |
+| Grid rebuild | 3.6 ms | 2.3 ms | Counting sort with windowed per-thread histograms, same result as one thread |
 
-This isn't just "faster code." It is a fundamental shift in architecture.
+On 25 Nov 2026 I ran the current build for 600 frames at 100,000 particles. The simulation step averaged 14.25 ms, under the 16.1 ms a 62 Hz frame allows. The worst frame took 39 ms. Other programs were running at the same time.
 
-### 1. Data-Oriented Design (SoA)
+## How it works
 
-Instead of an `Array of Structures` (AoS), I utilized a `Structure of Arrays` (SoA).
+- **Struct of arrays, no heap in the loop.** Positions, previous positions and heat sit in flat, fixed-size arrays. Nothing is allocated after start-up.
+- **Uniform grid, rebuilt every frame with a counting sort.** One cell is one particle wide. After the sort, the particles of each cell sit next to each other in memory, so the 3 x 3 neighbour search reads memory in order. A border of empty ghost cells removes the bounds checks.
+- **Verlet with a fixed time step.** The solver never reads the frame time. If the machine falls behind, the simulation slows down instead of blowing up.
+- **Many sub-steps, one pass each.** Overlap in a deep pile shrinks with the square of the sub-step size but only linearly with extra passes. The sub-step study is in `defines.hpp`:
 
-* **Result:** Positions and velocities are split into contiguous arrays.
-* **Benefit:** Predictable memory access patterns that maximize cache-line utilization and allow for compiler auto-vectorization.
+  | Sub-steps x passes | At 100k |
+  |---|---|
+  | 6 x 2 | Erupts from 40-50k and never settles |
+  | 12 x 1 | Settles at 60k, erupts again past ~90k |
+  | 16 x 1 | Settles, 2.6% mean overlap, no margin |
+  | 18 x 1 | Settles, 2.1% mean overlap (used) |
 
-### 2. The "No Heap" Manifesto
+- **Threads sized to the performance cores.** Every solver pass ends in a barrier, so one slow efficiency core holds up the other threads. On Apple Silicon the pool reads `hw.perflevel0.physicalcpu` instead of `hardware_concurrency()`. Set `PARTICLE_THREADS=N` to measure scaling yourself.
+- **Tried and dropped:** capping the contact kick. The best setting cost 14% of the frame to bring overlap from 19.0% to 17.5%.
 
-`new` and `malloc` are banned in the hot loop.
+## The V1 to V7 folders
 
-* All data lives in **static, fixed-size arrays**.
-* **Zero allocator overhead.**
-* **Zero pointer chasing.**
-* **Zero heap fragmentation.**
-* Far better cache behavior than scattered heap objects.
+Each folder is a full copy of the source at one stage, kept so you can see what each step bought:
 
-### 3. Spatial Hashing & Counting Sort
+1. `V1 (AoS)`: array of structs
+2. `V2 (SoA)`: struct of arrays, plus some features
+3. `V3`: a broken Verlet and small optimisations
+4. `V4`: Verlet fixed
+5. `V5`: better collisions, colours
+6. `V6`: different radii
+7. `V7`: mouse controls
 
-The naive approach checks every particle against every other particle **O(N^2)**.
+CMake builds only `src/`. To run an older version, copy its files over `src/`.
 
-* **Solution:** A Uniform Grid partitions the world into a discrete coordinate system.
-* **The Trick:** I use **Counting Sort O(Number of elements + Grid cells)** to sort particles by their cell index every frame, This reorganizes the particle indices into contiguous memory blocks corresponding to their grid location.
-* **Benefit:** Instead of jumping randomly through memory to check distant neighbors, the collision solver walks through linear blocks of data **O(N)**. This eliminates CPU cache thrashing and allows the processor to stream neighbor data at maximum bandwidth. 
+## Build and run
 
-**In short:** The collision algorithm that i'm using, behaves like a LinkedList of particles. And the **Counting Sort** is just making sure that the related particles' indices are contiguous like Array.
-
-### 4. Explicit Velocity
-
-Earlier versions used Verlet integration, where velocity is implied by the previous position. That made every collision fix also change the velocity, whether I wanted it to or not.
-
-The current solver keeps velocity in its own arrays and uses semi-implicit Euler: add gravity to the velocity, then move the position by the velocity. Unlike the plain Euler in my first version, it doesn't pump extra energy into the system. The contact solver still feeds part of each position fix back into velocity, because that spring is what makes piles pop and splash, but one constant (`COLLISION_REACTION_LOSS`) now decides how much.
-
-### 5. Multithreading
-
-The solver runs on 4 threads, one per performance core of the M1.
-
-* **Sized to the fast cores.** Every pass ends in a barrier, so the pool runs at the speed of its slowest thread. An efficiency core does this work at about a third of the speed, so the pool leaves them out (`hw.perflevel0.physicalcpu`) and they stay free for the OS and the renderer. Set `PARTICLE_THREADS` to try other counts.
-* **A spinning pool.** The solver hands out work about fifty times per frame. A normal `condition_variable` pool takes 10-50 µs to wake up, so the workers spin on one atomic instead and only sleep when nothing has arrived for a while.
-* **A parallel counting sort.** Each thread counts its own slice of particles into a private histogram, so no atomics are needed. The prefix sum gives every thread its own write cursors, and the result is byte-for-byte the same as the single-threaded sort.
-* **Row bands for contacts.** The grid is cut into two bands of rows per thread, sized by the work in each row (the sum of n² over its cells) instead of the particle count. Odd bands run in one pass and even bands in the next, so two threads never touch neighbouring rows at the same time.
-
-### Project Structure
-
-
-```text
-├── src/
-│   ├── main.cpp            # Entry point & Loop
-│   ├── solver.hpp/cpp      # The Physics Engine (Grid, Counting Sort, Contacts)
-│   ├── threading.hpp/cpp   # Spinning Thread Pool
-│   ├── renderer.hpp/cpp    # Visualization (Raylib)
-│   ├── particle.hpp        # SoA Data Structures
-│   └── defines.hpp         # Compile time parameters
-├── CMakeLists.txt          # Build File
-```
-
-There are multiple versions of the project (V1-V7), The CMake will only compile the code inside the src folder.
-The src folder holds the current version, which is newer than V7: it adds the thread pool. If you wish to run any older version, you can do that by:
-
-Manually setting up the CMake
-Or
-Copy/Over wite all of the files into the src folder
-
-## Prerequisites
-
-* **C++23 compatible compiler**
-* **CMake ≥ 3.25**
-
-### Linux
-
-```bash
-sudo apt install build-essential cmake
-```
-
-### macOS
-
-```bash
-brew install cmake
-```
-(Xcode Command Line Tools required)
-
-### Windows
-
-* Visual Studio 2022 or newer
-  (Install “Desktop development with C++”)
-* CMake (bundled with VS or installed separately)
-
-
-## Building the Project
-
-### 1. Clone the Repository
+Needs CMake 3.25+ and a C++23 compiler. Built and run on macOS with Apple Clang. CMake downloads raylib 6.0 on the first configure, about 100 MB.
 
 ```bash
 git clone https://github.com/ukasha167/Particle-Simulation.git
 cd Particle-Simulation
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+cd build && ./main      # run from build/, it loads ../assets/circle.png
 ```
 
-### 2. Create a Build Directory
+| Input | Action |
+|---|---|
+| Space | Start or stop the emitter |
+| Left mouse | Push particles away |
+| Right mouse | Pull particles in |
 
-```bash
-mkdir build
-cd build
-```
+The window is 1600 x 990. The top-left corner shows FPS, particle count and thread count. Physics settings are compile-time constants in `src/defines.hpp`, each with a comment on why it has that value.
 
-### 3. Generate Build Files
+## Licence
 
-```bash
-cmake ..
-```
-This will download the raylib. It might look stuck for sometime if you have slow internet, but wait for a while it will eventually download :D 
-(The actual size is ~100MB)
-
-### 4. Compile
-
-```bash
-cmake --build .
-```
-
-This produces a **native binary** for your platform.
-
-
-## Running the Simulation
-
-From the `build` directory:
-
-### Linux / macOS
-
-```bash
-./main
-```
-
-### Windows
-
-```powershell
-main.exe
-```
-
-
-### Future Roadmap
-
-Multithreading took it from 17k on one thread to 100k on four. The next step:
-
-* **Compute Shaders:** Moving the integration to the GPU for 1M+ particles.
-
-
-### License
-
-MIT License. Feel free to fork, learn, and optimize.
+MIT.
